@@ -1,0 +1,1 @@
+LCC Z zcore is 5.65295727365881 LCC p value is 0.00115 and distance z_score is -3.81202157175255

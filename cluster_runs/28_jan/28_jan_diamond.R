@@ -1,0 +1,322 @@
+args = commandArgs(trailingOnly=TRUE)
+
+if (!require("pacman")) install.packages("pacman", repos = getOption("repos"))
+pacman::p_load(tidyverse, igraph, parallel)
+
+seeds_10_weeks <- readRDS("../seeds10weeks.rds")
+
+STRING_mouse_700_removed_duplicates_extended <- readRDS("../STRING_mouse_700_removed_duplicates_extended.rds")
+
+
+
+STRING_mouse_700_vertices_extended <- STRING_mouse_700_removed_duplicates_extended %>%
+        select(protein1, protein2) %>%
+        flatten_chr() %>%
+        unique()
+
+string_igraph <- graph_from_data_frame(STRING_mouse_700_removed_duplicates_extended, directed = FALSE, vertices = STRING_mouse_700_vertices_extended)
+
+RML_data_26_May_ENTREZ_NAs_filtered <- readRDS("../RML_data_26_May_ENTREZ_NAs_filtered.rds")
+RML_data_26_May_ENTREZ_NAs_filtered$Comparison_DE <- gsub(" ", "", RML_data_26_May_ENTREZ_NAs_filtered$Comparison_DE)
+
+#===============================================================================
+#                calculate connectivity significance p values 
+#===============================================================================
+# ks: number of connections to all seeds (initial & diamond), ks0 (number of connections to inital seeds),
+# N: number of all the genes in the network
+# s: numer of all seed genes (inital seeds & diamond genes that become seeds), s0: number of initial seed genes
+# k: number of all connections (degree)
+# alpha.: seed weight
+
+get_CS <- function(ks, N, s, s0, k, alpha){ 
+  m <- s + (alpha-1)*s0
+  x <- ks
+  n <- N - s
+  K <- k 
+  
+  p_val <- phyper(q = x-1, m = m, n = n, k = K, lower.tail = FALSE)
+  p_val
+}
+
+#===============================================================================
+#          modified DIAMOnD using differential expression pvals and CS
+#===============================================================================
+
+pvalue_diamond_version <- function(seeds, PPI, iterations, alpha, celltype) { # celltype = "vGluT2/Cx43/Gad2
+  
+  
+  initial_seeds <- seeds # a vector of inital seed genes that is always the same
+  
+  s0 <- length(initial_seeds) # number of inital seeds
+  N <- gorder(PPI) # number of all the vertices in the network
+  
+  all_seeds <- vector("character", length = s0 + iterations) #after every iteration one diamond gene should be added to all seeds
+  all_seeds[1:s0] <- initial_seeds
+  
+  diamond_genes <- vector("character", length = iterations)  # after every iteration one diamond gene should be added to all seeds.
+  CS_pvals_allGenes <- vector("numeric", length = iterations)
+  ks_all_genes <- vector("integer", length = iterations)
+  k_all_genes <- vector("integer", length = iterations)
+  DE_pval_allGenes <- vector("numeric", length = iterations)
+  
+  
+  
+  i <- 1 #initialze a variable counting iterations steps
+  
+  while(i <= iterations){
+    
+    s <- length(which(all_seeds != "")) # number of all seeds
+    
+    all_seeds_defined <- all_seeds[which(all_seeds != "")]
+    
+    # find neighbors of all seeds
+    neighbors_all <- igraph::adjacent_vertices(graph = PPI, v = all_seeds_defined)
+    neighbors_all <- unlist(sapply(X = neighbors_all, FUN = as_ids, simplify = TRUE, USE.NAMES = TRUE))
+    neighbors_all <- unique(neighbors_all)
+    
+    # exclude from neighbors_all all the genes that are already in the module:
+    neighbors  <- neighbors_all[!neighbors_all %in% all_seeds_defined]
+    
+    # find neighbors of neighbors
+    
+    neighbors_of_neighbors<- igraph::adjacent_vertices(graph = PPI, v = neighbors)
+    neighbors_of_neighbors<- sapply(X = neighbors_of_neighbors, FUN = as_ids, simplify = TRUE, USE.NAMES = TRUE)
+    
+    # count how many neighbors of each neighbor are seeds (inital seeds and all seeds) --> make ks and ks0 vecs
+    
+    ks_of_neighbors <- sapply(neighbors_of_neighbors, function(x){
+      kb <- length(dplyr::intersect(x, all_seeds_defined))
+      return(kb)
+    }
+    , simplify = TRUE, USE.NAMES =TRUE)
+    
+    ks0_of_neighbors <- sapply(neighbors_of_neighbors, function(x){
+      kb <- length(dplyr::intersect(x, initial_seeds))
+      return(kb)
+    }
+    , simplify = TRUE, USE.NAMES =TRUE)
+    
+    
+    # get degree of all neighbors:
+    
+    neighbors_degrees <- degree(graph = PPI, v = neighbors)
+    
+    
+    #add weights to number of connections to seeds & total number of connections
+    
+    ks_final <- ks_of_neighbors + (alpha-1)*ks0_of_neighbors
+    k_final <- neighbors_degrees +(alpha-1)*ks0_of_neighbors
+    
+    # calculate connectivity significance p value for all neighbors
+    
+    CS_pvals <- mapply(ks = ks_final, k = k_final, N = N,
+                       s = s, s0 = s0, alpha = alpha, FUN = get_CS, SIMPLIFY = TRUE, USE.NAMES = TRUE)
+    
+    # rank CS_pvals
+    
+    CS_pvals_ranks <- rank(CS_pvals, na.last = TRUE, ties.method = "average" )
+    
+    #first df with ranks (just CS ranks):
+    
+    rank_df_1 <- data.frame(ENTREZ = neighbors,
+                            CS_Pvals = CS_pvals,
+                            CS_Pval_ranks = CS_pvals_ranks)
+    
+    
+    # get pvalues of all neighbors
+    
+    diff_expr_data_of_neigbors <- RML_data_26_May_ENTREZ_NAs_filtered %>% 
+      filter(Comparison_DE == paste("10Weeks__", celltype, sep = ""), ENTREZ %in% neighbors) %>%
+      group_by(ENTREZ) %>%
+      top_n(1, -log10(P_value)) %>% # if two genes have the same ENTREZ ID keep the gene with lower pval
+      select(ENTREZ, P_value) %>%
+      as.data.frame()
+    
+    # make 2nd df with ranks (both ranks) and a combined score
+    
+    rank_df_2 <- merge(x = rank_df_1, y = diff_expr_data_of_neigbors, by = "ENTREZ")
+    rank_df_2$diff_exp_pval_rank <- rank(rank_df_2$P_value, na.last = TRUE, ties.method = "average")
+    
+    rank_df_2  <- rank_df_2 %>%
+      rowwise() %>%
+      mutate(combined_score = 1/CS_Pval_ranks + 1/diff_exp_pval_rank) %>% 
+      as.data.frame()
+    
+    
+    # gene with the maximum combined score
+    
+    max_score <-  max(rank_df_2[, "combined_score"])
+    new_gene <- rank_df_2[rank_df_2$combined_score == max_score, "ENTREZ"]
+    
+    ks_new_gene <- ks_final[new_gene]
+    k_new_gene <- k_final[new_gene]
+    CS_new_gene <- CS_pvals[new_gene]
+    DE_pval_new_gene <- rank_df_2[rank_df_2$ENTREZ == new_gene, "P_value"]
+    
+    
+    
+    # add new gene to the list of diamond genes ( and corresponding CS p-value, ks , k, DE pval)
+    
+    diamond_genes[i] <- new_gene
+    CS_pvals_allGenes[i] <- CS_new_gene
+    ks_all_genes[i] <- ks_new_gene
+    k_all_genes[i] <- k_new_gene
+    DE_pval_allGenes[i] <- DE_pval_new_gene
+    
+    
+    
+    # add new gene to the list of seed genes
+    
+    all_seeds[s0 +i] <- new_gene
+    
+    # increase i by 1
+    i <- i +1
+    
+  }
+  
+  added_genes_df <- data.frame(gene = diamond_genes,
+                               degree = k_all_genes,
+                               connectivity = ks_all_genes,
+                               CS_pvalue = CS_pvals_allGenes,
+                               DE_pvalue = DE_pval_allGenes)
+  
+  module_genes_vec <- all_seeds
+  
+  results_list <- list(module_genes = module_genes_vec,
+                       added_genes = added_genes_df)
+  
+  
+  return(results_list)
+  
+  
+}
+
+
+
+
+# for all 3 cell types pvalue_diamond_version
+
+run_pvalue_diamond_version <- function(iteration_no){
+  result <- mcmapply(
+    FUN = run_pvalue_diamond_version,
+    seeds = seeds_10_weeks[1:3],
+    celltype = names(seeds_10_weeks[1:3]),
+    MoreArgs = list(
+      PPI = string_igraph,
+      iterations = iteration_no,
+      alpha = as.numeric(20)),
+    SIMPLIFY = FALSE, USE.NAMES = TRUE,
+    mc.preschedule = TRUE, mc.set.seed = TRUE,
+    mc.silent = FALSE, mc.cores = getOption("mc.cores", 3L),
+    mc.cleanup = TRUE, affinity.list = NULL)
+  
+  return(result)
+}
+
+b <- Sys.time()
+d <- run_pvalue_diamond_version(as.numeric(3))
+a <- Sys.time()
+a-b
+
+saveRDS(d, paste0("low_pval_genes_search_",args[2],"x.rds"))
+
+
+
+
+#===============================================================================
+#          modified DIAMOnD using differential expression pvals and CS
+#===============================================================================
+
+low_pval_genes_search <- function(seeds, PPI, iterations, celltype) { # celltype = "vGluT2/Cx43/Gad2
+  
+  
+  initial_seeds <- seeds 
+  
+  all_seeds <- initial_seeds #after every iteration one gene should be added to all seeds
+  
+  module_genes <- c()
+  DE_pval_allGenes <- c()
+  
+  
+  i <- 1 #initialze a variable counting iterations steps
+  
+  while(i <= iterations){
+    
+    # find neighbors of all seeds
+    neighbors_all <- igraph::adjacent_vertices(graph = PPI, v = all_seeds)
+    neighbors_all <- unlist(sapply(X = neighbors_all, FUN = as_ids, simplify = TRUE, USE.NAMES = TRUE))
+    neighbors_all <- unique(neighbors_all)
+    
+    # exclude from neighbors_all all the genes that are already in the module:
+    neighbors  <- neighbors_all[!neighbors_all %in% all_seeds]
+    
+    
+    # get pvalues of all neighbors
+    diff_expr_data_of_neigbors <- RML_data_26_May_ENTREZ_NAs_filtered %>% 
+      filter(Comparison_DE == paste("10Weeks__", celltype, sep = ""), ENTREZ %in% neighbors) %>%
+      group_by(ENTREZ) %>%
+      top_n(1, -log10(P_value)) %>% # if two genes have the same ENTREZ ID keep the gene with lower pval
+      select(ENTREZ, P_value) %>%
+      as.data.frame()
+    
+    # gene with the lowest pvalue
+    
+    min_pval <-  min(diff_expr_data_of_neigbors[, "P_value"])
+    new_gene <- diff_expr_data_of_neigbors[diff_expr_data_of_neigbors$P_value == min_pval, "ENTREZ"]
+    new_gene_pval <- diff_expr_data_of_neigbors[diff_expr_data_of_neigbors$ENTREZ == new_gene, "P_value"]
+    
+    # add new gene to the list of module genes (and its pbalue to the list of pvalues)
+    
+    module_genes <- c(module_genes, new_gene)
+    DE_pval_allGenes<- c(DE_pval_allGenes, new_gene_pval)
+    
+    
+    
+    # add new gene to the list of seed genes
+    
+    all_seeds <- c(all_seeds, new_gene)
+    
+    # increase i by 1
+    i <- i +1
+    
+  }
+  
+  added_genes_df <- data.frame(gene = module_genes,
+                               DE_pvalue = DE_pval_allGenes)
+  
+  module_genes_vec <- all_seeds
+  
+  results_list <- list(module_genes = module_genes_vec,
+                       added_genes = added_genes_df)
+  
+  
+  return(results_list)
+  
+}
+
+
+
+
+# for all 3 cell types low_pval_genes_search
+run_low_pval_genes_search <- function(iteration_no){
+                result <- mcmapply(
+                                 FUN = low_pval_genes_search,
+                                 seeds = seeds_10_weeks[1:3],
+                                 celltype = names(seeds_10_weeks[1:3]),
+                                 MoreArgs = list(
+                                         PPI = string_igraph,
+                                         iterations = iteration_no),
+                                 SIMPLIFY = FALSE, USE.NAMES = TRUE,
+                                 mc.preschedule = TRUE, mc.set.seed = TRUE,
+                                 mc.silent = FALSE, mc.cores = getOption("mc.cores", 3L),
+                                 mc.cleanup = TRUE, affinity.list = NULL)
+                
+                return(result)
+}
+
+b <- Sys.time()
+d <- run_low_pval_genes_search(as.numeric(10))
+a <- Sys.time()
+a-b
+
+saveRDS(d, paste0("low_pval_genes_search_",args[2],"x.rds"))
