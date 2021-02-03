@@ -2,7 +2,7 @@
 sbatch <<EOT
 #!/bin/sh
 
-#SBATCH -A snic2020-15-75
+#SBATCH -A snic2020-16-60
 #SBATCH -J $1 # name
 #SBATCH -o $1_%j.out
 #SBATCH -t $2 # time
