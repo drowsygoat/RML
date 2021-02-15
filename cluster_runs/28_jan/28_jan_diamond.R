@@ -227,7 +227,7 @@ run_pvalue_diamond_version <- function(iteration_no){
 }
 
 b <- Sys.time()
-d <- run_pvalue_diamond_version(args[2])
+d <- run_pvalue_diamond_version(as.numeric(args[2]))
 a <- Sys.time()
 a-b
 
