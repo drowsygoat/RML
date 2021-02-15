@@ -16,5 +16,5 @@ module purge
 module load R/4.0.0
 module --ignore-cache load gcc/10.1.0
 module load openmpi/3.1.6
-mpirun -n $4 R --no-save --args $6 $7 < $5
+mpirun -n $4 R --no-save --args $6 $7 < $5 # 5 is scriptname
 EOT
